@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
@@ -232,13 +231,30 @@ func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (
 	return proxy.ConnectDial(network, addr)
 }
 
+// closeWriter is the single-direction half-close capability. Both TCP
+// connections and the HTTP/2 stream wrapper implement it; wrappers that cannot
+// half-close simply do not, and the relay falls back to a full close.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// halfClosable marks a connection that supports shutting down either half
+// independently. TLS connections expose CloseWrite (a close_notify alert) but
+// only deliver EOF when fully closed, so both methods are required for the
+// relay to treat a half-close as visible to the peer.
 type halfClosable interface {
-	net.Conn
 	CloseWrite() error
 	CloseRead() error
 }
 
 var _ halfClosable = (*net.TCPConn)(nil)
+
+// canHalfClose reports whether a tunnel endpoint's peer will observe EOF when
+// only the write side is shut down.
+func canHalfClose(c net.Conn) bool {
+	_, ok := c.(halfClosable)
+	return ok
+}
 
 // connectResponseLine builds a CONNECT tunnel status line that echoes the
 // requesting client's HTTP version. These replies were previously hardcoded as
@@ -251,6 +267,262 @@ func connectResponseLine(r *http.Request, code int, text string) string {
 		major, minor = 1, 1
 	}
 	return fmt.Sprintf("HTTP/%d.%d %d %s\r\n\r\n", major, minor, code, text)
+}
+
+// requestCancelled reports whether the client that issued the CONNECT request
+// has gone away (HTTP/2 stream reset, request context cancellation).
+func requestCancelled(ctx *ProxyCtx) bool {
+	return ctx.Req != nil && ctx.Req.Context().Err() != nil
+}
+
+// dialConnectTunnel dials the CONNECT target. Unlike dial, it can be abandoned
+// when the client cancels while a custom dialer is still running: dialers
+// configured through ConnectDial/ConnectDialWithReq do not take a context, so
+// the dial runs in the background and a connection that completes after the
+// cancellation is closed instead of leaked.
+func (proxy *ProxyHttpServer) dialConnectTunnel(ctx *ProxyCtx, network, addr string) (net.Conn, error) {
+	reqCtx := context.Background()
+	if ctx.Req != nil {
+		reqCtx = ctx.Req.Context()
+	}
+	if err := reqCtx.Err(); err != nil {
+		return nil, err
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan dialResult, 1)
+	go func() {
+		c, err := proxy.connectDial(ctx, network, addr)
+		results <- dialResult{conn: c, err: err}
+	}()
+
+	select {
+	case res := <-results:
+		return res.conn, res.err
+	case <-reqCtx.Done():
+		go func() {
+			if res := <-results; res.conn != nil {
+				_ = res.conn.Close()
+			}
+		}()
+		return nil, reqCtx.Err()
+	}
+}
+
+// halfCloseWrite signals EOF to the peer of c without closing the read side.
+// Endpoints that cannot half-close (an opaque net.Conn wrapper) are left
+// untouched so the opposite direction can keep relaying.
+func halfCloseWrite(c net.Conn) {
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
+func halfCloseRead(c net.Conn) {
+	if cr, ok := c.(interface{ CloseRead() error }); ok {
+		_ = cr.CloseRead()
+	}
+}
+
+// abortTunnelConn tears a tunnel endpoint down immediately, unblocking any
+// copy parked in Read or Write. HTTP/2 streams implement Abort to also reset
+// the stream; plain TCP connections are fully closed.
+func abortTunnelConn(c net.Conn) {
+	if a, ok := c.(interface{ Abort() }); ok {
+		a.Abort()
+		return
+	}
+	_ = c.Close()
+}
+
+// tunnelCopyError reports an error from one of the tunnel copy directions.
+// The error is always observable through ctx.Error and the proxy log.
+// ConnectionErrHandler is invoked too (it may write a diagnostic to a
+// hijacked HTTP/1.1 connection), but an HTTP/2 CONNECT stream has already
+// started carrying tunnel data and must not receive a second HTTP response,
+// so its writer is replaced with io.Discard.
+func (proxy *ProxyHttpServer) tunnelCopyError(ctx *ProxyCtx, client net.Conn, err error) {
+	ctx.Error = err
+	ctx.Warnf("Error copying in CONNECT tunnel: %s", err)
+	if proxy.ConnectionErrHandler == nil {
+		return
+	}
+	var w io.Writer = client
+	if _, isH2 := client.(*h2StreamConn); isH2 {
+		w = io.Discard
+	}
+	proxy.ConnectionErrHandler(w, ctx, err)
+}
+
+// tunnelCopyClosedError reports whether err is the expected fallout of
+// tearing a tunnel down (closed sockets, cancelled contexts, reset HTTP/2
+// streams, the past write deadline used to unblock a flow-control-stalled
+// HTTP/2 write) rather than a genuine copy failure worth surfacing.
+func tunnelCopyClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var streamErr http2.StreamError
+	return errors.As(err, &streamErr)
+}
+
+// relayTunnel copies bytes in both directions until both directions are done,
+// or until one fails or cancel fires. clientSrc reads from client and may
+// replay bytes the HTTP parser already buffered (see bufferedClientReader).
+//
+// Half-close semantics:
+//   - A direction that reaches EOF half-closes the peer and the opposite
+//     direction keeps running, so a peer that shuts down its write side still
+//     receives the rest of the response.
+//   - An error, or a cancellation, aborts both sides so neither a copy
+//     goroutine nor the caller is left waiting on a dead tunnel.
+//
+// HTTP/2 cannot half-close a response body early: the END_STREAM flag is only
+// sent when ServeHTTP returns. The H2 caller therefore blocks in relayTunnel,
+// and relayTunnel finishes as soon as the upstream-to-client direction is done
+// so the response can be ended.
+func (proxy *ProxyHttpServer) relayTunnel(
+	ctx *ProxyCtx,
+	client net.Conn,
+	clientSrc io.Reader,
+	upstream net.Conn,
+	cancel <-chan struct{},
+) {
+	h2, isH2 := client.(*h2StreamConn)
+
+	var (
+		abortOnce sync.Once
+		aborted   = make(chan struct{})
+		finished  = make(chan struct{})
+		stopping  atomic.Bool
+	)
+	finish := func() {
+		select {
+		case <-finished:
+		default:
+			close(finished)
+		}
+	}
+	isAborted := func() bool {
+		select {
+		case <-aborted:
+			return true
+		default:
+			return false
+		}
+	}
+	abort := func(err error) {
+		abortOnce.Do(func() {
+			// Report before tearing down so a handler that can still write
+			// (HTTP/1.1) sees a usable connection.
+			if err != nil {
+				proxy.tunnelCopyError(ctx, client, err)
+			}
+			// Waking the copies unblocks Read/Write; isAborted then suppresses
+			// their follow-up errors so only the root cause is reported.
+			abortTunnelConn(client)
+			abortTunnelConn(upstream)
+			close(aborted)
+		})
+	}
+
+	// watcherDone makes finish wait for the cancellation watcher: it may be
+	// running abort, which touches the HTTP/2 ResponseWriter, and that must
+	// not outlive the ServeHTTP return.
+	var watcherDone chan struct{}
+	if cancel != nil {
+		watcherDone = make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			select {
+			case <-cancel:
+				select {
+				case <-finished:
+				default:
+					// The client is gone (e.g. an HTTP/2 RST_STREAM); there is
+					// nobody left to report to, only the copies to stop.
+					abort(nil)
+				}
+			case <-finished:
+			}
+		}()
+	}
+
+	// Half-closing only helps if the peer can observe it: a TCP connection
+	// does, a TLS one only reports EOF once fully closed, and an opaque
+	// net.Conn wrapper may not implement it at all. A direction whose peer
+	// cannot see EOF must tear the tunnel down instead of waiting for it.
+	clientCanHalfClose := canHalfClose(client)
+	upstreamCanHalfClose := canHalfClose(upstream)
+
+	copyDir := func(dst net.Conn, src net.Conn, srcReader io.Reader, canHalfClose bool) error {
+		_, err := io.Copy(dst, srcReader)
+		if err != nil {
+			if !stopping.Load() && !isAborted() && !tunnelCopyClosedError(err) {
+				abort(fmt.Errorf("copy %s -> %s: %w", src.RemoteAddr(), dst.RemoteAddr(), err))
+			}
+			return err
+		}
+		if !canHalfClose {
+			// The opposite peer can never observe our EOF, so waiting for it
+			// could block forever. Tear the whole tunnel down instead.
+			abort(nil)
+			return nil
+		}
+		// Normal EOF: tell the peer no more data is coming, but keep the
+		// opposite direction alive so it can finish its own transfer.
+		halfCloseWrite(dst)
+		halfCloseRead(src)
+		return nil
+	}
+
+	upToClient := make(chan error, 1)
+	clientToUp := make(chan error, 1)
+
+	go func() {
+		// An HTTP/2 response cannot be half-closed; returning from the
+		// handler emits END_STREAM, so writes are disabled here instead and
+		// the handler return below finishes the response.
+		upToClient <- copyDir(client, upstream, upstream, isH2 || clientCanHalfClose)
+	}()
+	go func() {
+		clientToUp <- copyDir(upstream, client, clientSrc, upstreamCanHalfClose)
+	}()
+
+	// Wait for the response direction first: it determines when a handler
+	// must return. The request direction is interrupted below.
+	<-upToClient
+	if isH2 {
+		// The response side is done. There is no way to keep serving the
+		// request direction after ServeHTTP returns, so stop it now: closing
+		// the request body and the upstream connection unblocks both a pending
+		// Read of the H2 stream and a pending Write to the upstream server.
+		// This does not reset the stream, so a normally finished response
+		// still ends with a clean END_STREAM. The resulting read error is
+		// expected and must not be reported as a tunnel failure.
+		stopping.Store(true)
+		_ = h2.Close()
+		_ = upstream.Close()
+	}
+	<-clientToUp
+
+	finish()
+	if watcherDone != nil {
+		// Do not let the watcher touch the HTTP/2 stream after ServeHTTP
+		// returns; it exits promptly once finished is closed.
+		<-watcherDone
+	}
+	// Fully release both endpoints: half-closes only shut down one direction
+	// and would keep the descriptors, and any blocked reader, alive.
+	_ = client.Close()
+	_ = upstream.Close()
 }
 
 func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
@@ -359,9 +631,15 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		if !hasPort(host) {
 			host += ":80"
 		}
-		targetSiteCon, err := proxy.connectDial(ctx, "tcp", host)
+		targetSiteCon, err := proxy.dialConnectTunnel(ctx, "tcp", host)
 		if err != nil {
 			ctx.Warnf("Error dialing to %s: %s", host, err.Error())
+			if requestCancelled(ctx) {
+				// The client cancelled while we were dialing: abort the tunnel
+				// instead of writing a response nobody is left to read.
+				abortTunnelConn(proxyClient)
+				return
+			}
 			httpError(proxyClient, ctx, err)
 			return
 		}
@@ -369,36 +647,29 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		// In HTTP/1.1 mode the client is waiting for the 200 confirmation;
 		// In HTTP/2 mode we send it now, after we know the dial succeeded.
 		if isH2Tunnel {
+			if requestCancelled(ctx) {
+				// Client left during the dial: don't start a stream it will
+				// never read, and release the upstream connection.
+				_ = targetSiteCon.Close()
+				abortTunnelConn(proxyClient)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
 
-			// H2 handler must block until the tunnel closes, the HTTP/2 server
-			// keeps the stream alive only while ServeHTTP is running.
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				err := copyOrWarn(ctx, targetSiteCon, proxyClient)
-				if err != nil && proxy.ConnectionErrHandler != nil {
-					proxy.ConnectionErrHandler(proxyClient, ctx, err)
-				}
-				_ = targetSiteCon.Close()
-				// Goroutine 2 may be blocked writing to the H2 stream (flow-control
-				// stall). Set a past deadline to unblock it immediately.
-				_ = proxyClient.SetWriteDeadline(time.Now())
-			}()
-			go func() {
-				defer wg.Done()
-				_ = copyOrWarn(ctx, proxyClient, targetSiteCon)
-				// Close r.Body to unblock goroutine 1 if it is still reading from
-				// the H2 stream.
-				_ = proxyClient.Close()
-			}()
-			wg.Wait()
+			// The H2 handler must block until the tunnel closes: the HTTP/2
+			// server keeps the stream alive only while ServeHTTP is running.
+			// Cancelling the request (stream reset) aborts both copies below.
+			proxy.relayTunnel(ctx, proxyClient, proxyClient, targetSiteCon, r.Context().Done())
 		} else {
-			_, _ = proxyClient.Write([]byte(connectResponseLine(r, http.StatusOK, "Connection established")))
+			if _, err := proxyClient.Write([]byte(connectResponseLine(r, http.StatusOK, "Connection established"))); err != nil {
+				ctx.Warnf("Error confirming CONNECT to client: %s", err)
+				_ = targetSiteCon.Close()
+				_ = proxyClient.Close()
+				return
+			}
 
 			// The client may have sent its first bytes (e.g. a TLS ClientHello) in the
 			// same write as the CONNECT request, so those bytes are still in the request
@@ -406,51 +677,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			// them stranded.
 			clientSrc := bufferedClientReader(hijackedReader, proxyClient)
 
-			targetTCP, targetOK := targetSiteCon.(halfClosable)
-			proxyClientTCP, clientOK := proxyClient.(halfClosable)
-			if targetOK && clientOK {
-				go func() {
-					var wg sync.WaitGroup
-					wg.Add(2)
-					go copyAndClose(ctx, targetTCP, proxyClientTCP, clientSrc, &wg)
-					go copyAndClose(ctx, proxyClientTCP, targetTCP, targetTCP, &wg)
-					wg.Wait()
-					// Make sure to close the underlying TCP socket.
-					// CloseRead() and CloseWrite() keep it open until its timeout,
-					// causing error when there are thousands of requests.
-					proxyClientTCP.Close()
-					targetTCP.Close()
-				}()
-			} else {
-				// There is a race with the runtime here. In the case where the
-				// connection to the target site times out, we cannot control which
-				// io.Copy loop will receive the timeout signal first. This means
-				// that in some cases the error passed to the ConnErrorHandler will
-				// be the timeout error, and in other cases it will be an error raised
-				// by the use of a closed network connection.
-				//
-				// 2020/05/28 23:42:17 [001] WARN: Error copying to client: read tcp 127.0.0.1:33742->127.0.0.1:34763: i/o timeout
-				// 2020/05/28 23:42:17 [001] WARN: Error copying to client: read tcp 127.0.0.1:45145->127.0.0.1:60494: use of closed
-				//                                                          network connection
-				//
-				// It's also not possible to synchronize these connection closures due to
-				// TCP connections which are half-closed. When this happens, only the one
-				// side of the connection breaks out of its io.Copy loop. The other side
-				// of the connection remains open until it either times out or is reset by
-				// the client.
-				go func() {
-					err := copyOrWarn(ctx, targetSiteCon, clientSrc)
-					if err != nil && proxy.ConnectionErrHandler != nil {
-						proxy.ConnectionErrHandler(proxyClient, ctx, err)
-					}
-					_ = targetSiteCon.Close()
-				}()
-
-				go func() {
-					_ = copyOrWarn(ctx, proxyClient, targetSiteCon)
-					_ = proxyClient.Close()
-				}()
-			}
+			// The tunnel outlives this handler: the connection is hijacked, so
+			// ServeHTTP can (and should) return to unblock the HTTP/1.x server.
+			go proxy.relayTunnel(ctx, proxyClient, clientSrc, targetSiteCon, nil)
 		}
 
 	case ConnectHijack:
@@ -471,6 +700,12 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		// For HTTP/2 (isH2Tunnel), the handler must block, the HTTP/2 server keeps the H2
 		// stream alive only while ServeHTTP is running; returning early closes the stream.
 		mitmWork := func() {
+			// For an HTTP/2 CONNECT the session must be cancelled when the
+			// client abandons the stream, so its inner requests inherit that
+			// context. For hijacked HTTP/1.1 the request context dies with
+			// ServeHTTP, so background is the only valid choice.
+			baseCtx := proxy.mitmBaseContext(isH2Tunnel, r)
+
 			// Check if this is an HTTP or an HTTPS MITM request. The CONNECT
 			// request was parsed through the hijacked reader, so any bytes the
 			// client sent in the same write (e.g. a TLS ClientHello) are buffered
@@ -509,20 +744,20 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				// Create a TLS connection over the TCP connection
 				rawClientTls := tls.Server(client, tlsConfig)
 				client = rawClientTls
-				if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
+				if err := rawClientTls.HandshakeContext(baseCtx); err != nil {
 					ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
 					return
 				}
 				if proxy.AllowHTTP2 && rawClientTls.ConnectionState().NegotiatedProtocol == "h2" {
 					ctx.Logf("ALPN negotiated h2, starting http2.ServeConn")
-					proxy.serveH2Mitm(client, host, ctx)
+					proxy.serveH2Mitm(baseCtx, client, host, ctx)
 					return
 				}
 			} else if proxy.AllowHTTP2 {
 				// Handle cleartext HTTP/2 (h2c) by looking for the client preface.
 				preface, err := readBuffer.Peek(len(http2.ClientPreface))
 				if err == nil && string(preface) == http2.ClientPreface {
-					proxy.serveH2Mitm(client, host, ctx)
+					proxy.serveH2Mitm(baseCtx, client, host, ctx)
 					return
 				}
 			}
@@ -547,6 +782,14 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				}
 				if err != nil {
 					return
+				}
+				// The parsed request has no context of its own. Bind it to the
+				// tunnel's base context so an HTTP/2 client that abandons the
+				// stream cancels this upstream request (and its body reads)
+				// instead of letting it run to completion unobserved.
+				if baseCtx != req.Context() {
+					req = req.WithContext(baseCtx)
+					ctx.Req = req
 				}
 				// The hijacked MITM connection has no net/http server to send
 				// 100 Continue when a handler reads the request body.
@@ -710,6 +953,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		if isH2Tunnel {
 			mitmWork()
 		} else {
+			// The hijacked MITM loop outlives ServeHTTP, so it cannot use the
+			// request context, which the HTTP/1 server cancels on return.
 			go mitmWork()
 		}
 	}
@@ -756,27 +1001,6 @@ func copyOrWarn(ctx *ProxyCtx, dst io.Writer, src io.Reader) error {
 		ctx.Warnf("Error copying to client: %s", err)
 	}
 	return err
-}
-
-// copyAndClose copies from srcReader to dst, then half-closes both. srcReader reads
-// src, possibly after bytes already buffered from it (see bufferedClientReader).
-func copyAndClose(ctx *ProxyCtx, dst, src halfClosable, srcReader io.Reader, wg *sync.WaitGroup) {
-	_, err := io.Copy(dst, srcReader)
-	if err != nil {
-		if !errors.Is(err, net.ErrClosed) {
-			ctx.Warnf("Error copying to client: %s", err.Error())
-		}
-		// Fully close dst to unblock any goroutine blocked on
-		// io.Copy reading from it. Half-close (CloseWrite/CloseRead)
-		// would not interrupt a pending read, leaving the other
-		// goroutine stuck and the client connection never closed.
-		_ = dst.Close()
-		_ = src.Close()
-	} else {
-		_ = dst.CloseWrite()
-		_ = src.CloseRead()
-	}
-	wg.Done()
 }
 
 func dialerFromEnv(proxy *ProxyHttpServer) func(network, addr string) (net.Conn, error) {

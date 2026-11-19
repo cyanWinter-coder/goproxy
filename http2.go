@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,12 +22,22 @@ import (
 // We implement net.Conn directly on top of the H2 stream:
 //   - Read: r.Body  (the request body carries client -> proxy data)
 //   - Write: w      (the response body carries proxy -> client data)
+//
+// HTTP/2 has no close-write primitive for a response body: END_STREAM is only
+// sent when the ServeHTTP handler returns. CloseWrite can therefore only stop
+// further writes; the tunnel relay returns from the handler to finish the
+// response. Abort additionally unblocks a copy that is stuck writing to the
+// stream (for example, blocked by flow control after the client went away).
 type h2StreamConn struct {
 	r      io.ReadCloser
 	w      http.ResponseWriter
 	ctrl   *http.ResponseController
 	local  net.Addr
 	remote net.Addr
+
+	closeOnce sync.Once
+	abortOnce sync.Once
+	wclosed   atomic.Bool
 }
 
 // responseWriterProvider is implemented by h2StreamConn so that httpError
@@ -54,6 +65,11 @@ func (c *h2StreamConn) Read(b []byte) (int, error) {
 }
 
 func (c *h2StreamConn) Write(b []byte) (int, error) {
+	if c.wclosed.Load() {
+		// Never write after the client-facing side was shut down: the
+		// stream may already carry END_STREAM or have been reset.
+		return 0, net.ErrClosed
+	}
 	n, err := c.w.Write(b)
 	if err == nil {
 		_ = c.ctrl.Flush()
@@ -61,8 +77,34 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Close closes the client-to-proxy half of the tunnel. It does not end the
+// proxy-to-client half; the relay calls CloseWrite/Abort explicitly so a
+// direction that finished normally can still deliver its remaining bytes.
 func (c *h2StreamConn) Close() error {
-	return c.r.Close()
+	var err error
+	c.closeOnce.Do(func() { err = c.r.Close() })
+	return err
+}
+
+// CloseWrite stops further writes to the client. HTTP/2 cannot half-close a
+// response before the handler returns, so END_STREAM is deferred to the
+// handler return; callers must return from ServeHTTP once both directions are
+// done (which the tunnel relay does).
+func (c *h2StreamConn) CloseWrite() error {
+	c.wclosed.Store(true)
+	return nil
+}
+
+// Abort unblocks pending reads and writes so relay goroutines exit promptly
+// when the tunnel is torn down. The write side is reset (rather than just
+// closed) because a goroutine may be blocked in Write on flow control, which
+// CloseWrite alone cannot interrupt.
+func (c *h2StreamConn) Abort() {
+	c.abortOnce.Do(func() {
+		c.wclosed.Store(true)
+		_ = c.r.Close()
+		_ = c.ctrl.SetWriteDeadline(time.Now())
+	})
 }
 
 func (c *h2StreamConn) LocalAddr() net.Addr {
@@ -105,18 +147,42 @@ func (a h2streamAddr) String() string {
 //   - host is the CONNECT target (e.g. "example.com:443").
 //   - parentCtx carries the UserData / CertStore / RoundTripper from the CONNECT handler,
 //     propagated into every per-stream ProxyCtx.
-func (proxy *ProxyHttpServer) serveH2Mitm(client net.Conn, host string, parentCtx *ProxyCtx) {
+//   - baseCtx scopes the whole HTTP/2 connection. For a CONNECT that arrived
+//     over HTTP/2 it is the CONNECT stream's context, so a client that goes
+//     away cancels in-flight streams instead of leaving their RoundTrips
+//     running. For a hijacked HTTP/1.1 tunnel it must be a background
+//     context: the request context is cancelled as soon as ServeHTTP returns,
+//     which would tear the very tunnel down immediately.
+func (proxy *ProxyHttpServer) serveH2Mitm(
+	baseCtx context.Context,
+	client net.Conn,
+	host string,
+	parentCtx *ProxyCtx,
+) {
 	scheme := "https"
 	if _, isTLS := client.(*tls.Conn); !isTLS {
 		scheme = "http"
 	}
 
 	proxy.h2Server.ServeConn(client, &http2.ServeConnOpts{
-		Context: context.Background(),
+		Context: baseCtx,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			proxy.handleH2MitmStream(w, r, host, scheme, parentCtx)
 		}),
 	})
+}
+
+// mitmBaseContext returns the context that scopes an HTTP/2 MITM connection.
+// A CONNECT received over HTTP/2 still has a live request context, so it is
+// used to cancel in-flight streams when the client goes away. A hijacked
+// HTTP/1.1 request context is cancelled the moment the hijacking handler
+// returns (which is immediately, for a backgrounded MITM loop), so it cannot
+// scope the session; background is used there instead.
+func (proxy *ProxyHttpServer) mitmBaseContext(isH2Tunnel bool, r *http.Request) context.Context {
+	if isH2Tunnel && r.Context().Err() == nil {
+		return r.Context()
+	}
+	return context.Background()
 }
 
 // handleH2MitmStream handles a single HTTP/2 stream inside a MITM session,

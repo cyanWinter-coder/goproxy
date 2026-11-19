@@ -38,6 +38,10 @@ type ProxyHttpServer struct {
 	// to a target proxy.
 	// The error is passed as function parameter and not inside the proxy
 	// context, to avoid race conditions.
+	// For an HTTP/2 CONNECT tunnel the response has already started by the
+	// time a copy can fail, so the handler is still called (the error must
+	// stay observable) but conn is io.Discard: writing another HTTP response
+	// into the stream is not allowed.
 	ConnectionErrHandler func(conn io.Writer, ctx *ProxyCtx, err error)
 	// ConnectDial will be used to create TCP connections for CONNECT requests
 	// if nil Tr.Dial will be used
